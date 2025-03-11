@@ -13,7 +13,7 @@ import configparser
 import yt_dlp
 import html
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TCON, USLT
+from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TCON, USLT, TRCK
 import musicbrainzngs
 
 class ArtworkSelectorDialog(tk.Toplevel):
@@ -367,6 +367,12 @@ class MusicLibraryExtender:
         self.genre_entry = ttk.Entry(details_frame, textvariable=self.genre_var, width=40, font=("Arial", 11))
         self.genre_entry.grid(row=4, column=1, sticky=tk.W+tk.E, pady=5)
         
+        # Track Number
+        self.track_var = tk.StringVar()
+        ttk.Label(details_frame, text="Track #:", font=("Arial", 11)).grid(row=5, column=0, sticky=tk.W, pady=5)
+        self.track_entry = ttk.Entry(details_frame, textvariable=self.track_var, width=40, font=("Arial", 11))
+        self.track_entry.grid(row=5, column=1, sticky=tk.W+tk.E, pady=5)
+        
         details_frame.columnconfigure(1, weight=1)
         
         lyrics_section_frame = ttk.Frame(self.preview_frame)
@@ -563,6 +569,9 @@ class MusicLibraryExtender:
             self.artwork_options = []
             self.artwork_counter_var.set("")
             
+            # Reset the track number to ensure we get fresh data
+            self.track_var.set("")
+            
             if hasattr(self, 'album_art_data'):
                 delattr(self, 'album_art_data')
             
@@ -576,16 +585,43 @@ class MusicLibraryExtender:
                     recording = result['recording-list'][0]
                     
                     if 'release-list' in recording and recording['release-list']:
-                        album_title = recording['release-list'][0].get('title', '')
+                        release = recording['release-list'][0]
+                        
+                        # Set album title
+                        album_title = release.get('title', '')
                         if album_title:
                             self.root.after(0, lambda: self.album_var.set(album_title))
+                        
+                        # Set release date/year
+                        if 'date' in release:
+                            release_date = release['date']
+                            year_match = re.match(r'(\d{4})', release_date)
+                            if year_match:
+                                self.root.after(0, lambda: self.year_var.set(year_match.group(1)))
+                        
+                        # Try to get track number from the medium-list if available
+                        if 'medium-list' in release:
+                            for medium in release['medium-list']:
+                                if 'track-list' in medium:
+                                    for track in medium['track-list']:
+                                        if 'recording' in track and track['recording']['id'] == recording['id']:
+                                            # Found the track in this medium
+                                            track_number = track.get('number')
+                                            if track_number:
+                                                self.root.after(0, lambda tn=track_number: self.track_var.set(tn))
+                                                print(f"Found track number from MusicBrainz: {track_number}")
+                                                break
+                        
+                        # If we have a release ID, try to get more detailed track info and cover art
+                        release_id = release.get('id')
+                        if release_id:
+                            # Start thread to fetch album art
+                            threading.Thread(target=self._fetch_album_art, args=(release_id,), daemon=True).start()
+                            
+                            # Also fetch more detailed release info including track position
+                            threading.Thread(target=self._fetch_release_details, args=(release_id, recording['id']), daemon=True).start()
                     
-                    if 'release-list' in recording and recording['release-list'] and 'date' in recording['release-list'][0]:
-                        release_date = recording['release-list'][0]['date']
-                        year_match = re.match(r'(\d{4})', release_date)
-                        if year_match:
-                            self.root.after(0, lambda: self.year_var.set(year_match.group(1)))
-                    
+                    # Get genre from tags
                     if 'tag-list' in recording:
                         genres = []
                         for tag in recording['tag-list']:
@@ -599,11 +635,6 @@ class MusicLibraryExtender:
                         
                         if genres:
                             self.root.after(0, lambda: self.genre_var.set(", ".join(genres[:2])))
-                    
-                    if 'release-list' in recording and recording['release-list']:
-                        release_id = recording['release-list'][0].get('id')
-                        if release_id:
-                            threading.Thread(target=self._fetch_album_art, args=(release_id,), daemon=True).start()
             except Exception as e:
                 print(f"Error fetching metadata from MusicBrainz: {str(e)}")
         except Exception as e:
@@ -916,6 +947,11 @@ class MusicLibraryExtender:
             if self.genre_var.get():
                 tags.add(TCON(encoding=3, text=self.genre_var.get()))
                 print(f"Added genre: {self.genre_var.get()}")
+                
+            # Set track number if provided
+            if self.track_var.get():
+                tags.add(TRCK(encoding=3, text=self.track_var.get()))
+                print(f"Added track number: {self.track_var.get()}")
             
             # Add lyrics if provided
             lyrics_text = self.lyrics_text.get(1.0, tk.END).strip()
@@ -1213,6 +1249,37 @@ class MusicLibraryExtender:
             self.lyrics_text.insert(tk.END, "No lyrics found. You can add them manually.")
             
             self.status_var.set("No lyrics found")
+    
+    def _fetch_release_details(self, release_id, recording_id):
+        """Fetch more detailed release info from MusicBrainz including track position"""
+        try:
+            # Get full release info with MusicBrainz API
+            release = musicbrainzngs.get_release_by_id(release_id, includes=["recordings", "media"])
+            
+            if not release or 'release' not in release:
+                print(f"No detailed release info found for {release_id}")
+                return
+                
+            release_data = release['release']
+            
+            # Look for our recording in the media/tracks
+            if 'medium-list' in release_data:
+                for medium in release_data['medium-list']:
+                    if 'track-list' in medium:
+                        disc_num = medium.get('position', '1')
+                        
+                        for track in medium['track-list']:
+                            if 'recording' in track and track['recording']['id'] == recording_id:
+                                # Found our track
+                                track_num = track.get('position', '')
+                                if track_num:
+                                    # Format as "disc/track" if multi-disc release, otherwise just track number
+                                    track_number = f"{disc_num}/{track_num}" if int(disc_num) > 1 else track_num
+                                    self.root.after(0, lambda tn=track_number: self.track_var.set(tn))
+                                    print(f"Found detailed track position from MusicBrainz: {track_number}")
+                                    return
+        except Exception as e:
+            print(f"Error fetching detailed release info from MusicBrainz: {str(e)}")
         
 if __name__ == "__main__":
     root = tk.Tk()
