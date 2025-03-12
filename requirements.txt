@@ -1,5 +1,6 @@
-yt-dlp>=2023.03.04
-requests>=2.28.1
-Pillow>=9.2.0
-mutagen>=1.45.1
-musicbrainzngs>=0.7.1
+musicbrainzngs==0.7.1
+mutagen==1.47.0
+Pillow==11.1.0
+Requests==2.32.3
+rich==13.9.4
+yt_dlp==2025.2.19

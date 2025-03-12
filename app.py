@@ -15,6 +15,12 @@ import html
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC, TCON, USLT, TRCK
 import musicbrainzngs
+import argparse
+import sys
+import json
+from rich.console import Console
+from rich.table import Table
+from rich.progress import Progress, TaskID
 
 class ArtworkSelectorDialog(tk.Toplevel):
     def __init__(self, parent, artwork_list):
@@ -1281,7 +1287,721 @@ class MusicLibraryExtender:
         except Exception as e:
             print(f"Error fetching detailed release info from MusicBrainz: {str(e)}")
         
+class CLIHandler:
+    """Command line interface handler for MusicLibraryExtender"""
+    
+    def __init__(self):
+        self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.ini")
+        self.config = configparser.ConfigParser()
+        self.library_location = os.path.join(os.path.expanduser("~"), "Music")
+        self.load_settings()
+        
+        # Initialize MusicBrainz API for metadata
+        musicbrainzngs.set_useragent("MusicLibraryExtender", "1.0.0", "https://github.com/TheBeaconCrafter/MusicLibraryExtender")
+        
+        self.console = Console()
+        self.last_search_results = []
+        
+        # Load cached search results if they exist
+        self.search_cache_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".search_cache.json")
+        self._load_search_cache()
+    
+    def _load_search_cache(self):
+        """Load cached search results from file"""
+        try:
+            if os.path.exists(self.search_cache_file):
+                with open(self.search_cache_file, 'r') as f:
+                    self.last_search_results = json.load(f)
+                    self.console.print(f"[dim]Loaded {len(self.last_search_results)} cached search results[/dim]")
+        except Exception as e:
+            self.console.print(f"[yellow]Could not load search cache: {e}[/yellow]")
+            self.last_search_results = []
+            
+    def _save_search_cache(self):
+        """Save search results to cache file"""
+        try:
+            with open(self.search_cache_file, 'w') as f:
+                json.dump(self.last_search_results, f)
+        except Exception as e:
+            self.console.print(f"[yellow]Could not save search cache: {e}[/yellow]")
+    
+    def load_settings(self):
+        """Load settings from the config file or use defaults"""
+        if os.path.exists(self.config_file):
+            try:
+                self.config.read(self.config_file)
+                if 'Settings' in self.config:
+                    if 'library_location' in self.config['Settings']:
+                        saved_path = self.config['Settings']['library_location']
+                        if os.path.exists(saved_path):
+                            self.library_location = saved_path
+            except Exception as e:
+                self.console.print(f"[red]Error loading settings: {e}[/red]")
+    
+    def save_settings(self):
+        """Save settings to the config file"""
+        if 'Settings' not in self.config:
+            self.config['Settings'] = {}
+            
+        self.config['Settings']['library_location'] = self.library_location
+        
+        try:
+            with open(self.config_file, 'w') as configfile:
+                self.config.write(configfile)
+        except Exception as e:
+            self.console.print(f"[red]Error saving settings: {e}[/red]")
+    
+    def search_videos(self, query, limit=10, json_output=False):
+        """Search for videos and display results"""
+        self.console.print(f"[bold blue]Searching for:[/bold blue] {query}")
+        
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': 'in_playlist',
+                'default_search': f'ytsearch{limit}',
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+                if 'entries' in info:
+                    results = []
+                    
+                    for i, entry in enumerate(info['entries']):
+                        if not entry:
+                            continue
+                            
+                        duration_secs = entry.get('duration', 0)
+                        duration = time.strftime('%M:%S', time.gmtime(duration_secs)) if duration_secs else 'Unknown'
+                        
+                        video_url = entry.get('webpage_url')
+                        if not video_url and entry.get('id'):
+                            video_url = f"https://www.youtube.com/watch?v={entry['id']}"
+                            
+                        result = {
+                            "id": entry['id'],
+                            "title": entry.get('title', 'Unknown Title'),
+                            "channel": entry.get('uploader', 'Unknown Uploader'),
+                            "duration": duration,
+                            "thumbnail": entry.get('thumbnail'),
+                            "webpage_url": video_url
+                        }
+                        results.append(result)
+                    
+                    # Store results for later use
+                    self.last_search_results = results
+                    # Save to cache file for persistence between commands
+                    self._save_search_cache()
+                    
+                    if json_output:
+                        print(json.dumps(results, indent=2))
+                    else:
+                        table = Table(title="Search Results")
+                        table.add_column("#", justify="right", style="cyan", no_wrap=True)
+                        table.add_column("Title", style="white")
+                        table.add_column("Channel", style="green")
+                        table.add_column("Duration", justify="right", style="blue")
+                        table.add_column("URL", style="magenta")
+                        
+                        for i, video in enumerate(results):
+                            table.add_row(
+                                str(i+1),
+                                video["title"],
+                                video["channel"],
+                                video["duration"],
+                                video["webpage_url"]
+                            )
+                        
+                        self.console.print(table)
+                    
+                    return results
+                else:
+                    self.console.print("[red]No results found[/red]")
+                    return []
+        except Exception as e:
+            self.console.print(f"[red]Search error: {str(e)}[/red]")
+            return []
+    
+    def get_metadata(self, artist, title):
+        """Fetch metadata for the specified artist and title"""
+        self.console.print(f"[bold blue]Looking up metadata for:[/bold blue] {artist} - {title}")
+        
+        metadata = {
+            "artist": artist,
+            "title": title,
+            "album": "",
+            "year": "",
+            "genre": "",
+            "track_number": "",
+            "artwork_url": None,
+            "lyrics": None
+        }
+        
+        # Try to get metadata from MusicBrainz
+        try:
+            search_query = f"artist:{artist} AND recording:{title}"
+            result = musicbrainzngs.search_recordings(query=search_query, limit=1)
+            
+            if result and 'recording-list' in result and result['recording-list']:
+                recording = result['recording-list'][0]
+                
+                if 'release-list' in recording and recording['release-list']:
+                    release = recording['release-list'][0]
+                    
+                    # Set album title
+                    album_title = release.get('title', '')
+                    if album_title:
+                        metadata["album"] = album_title
+                    
+                    # Set release date/year
+                    if 'date' in release:
+                        release_date = release['date']
+                        year_match = re.match(r'(\d{4})', release_date)
+                        if year_match:
+                            metadata["year"] = year_match.group(1)
+                    
+                    # Try to get track number
+                    if 'medium-list' in release:
+                        for medium in release['medium-list']:
+                            if 'track-list' in medium:
+                                for track in medium['track-list']:
+                                    if 'recording' in track and track['recording']['id'] == recording['id']:
+                                        track_number = track.get('number')
+                                        if track_number:
+                                            metadata["track_number"] = track_number
+                                            break
+                    
+                    # Get cover art URL if available
+                    release_id = release.get('id')
+                    if release_id:
+                        try:
+                            # Check if artwork exists
+                            url = f"https://coverartarchive.org/release/{release_id}/front-500"
+                            response = requests.head(url)
+                            if response.status_code == 307:  # Redirect to the actual image
+                                metadata["artwork_url"] = url
+                        except Exception as e:
+                            self.console.print(f"[yellow]Error checking artwork: {str(e)}[/yellow]")
+                
+                # Get genre from tags
+                if 'tag-list' in recording:
+                    genres = []
+                    for tag in recording['tag-list']:
+                        if tag.get('name') and tag.get('count', 0) > 0:
+                            tag_name = tag['name'].lower()
+                            if tag_name in ['rock', 'pop', 'jazz', 'classical', 'electronic', 'hip-hop', 'rap', 
+                                          'metal', 'country', 'folk', 'blues', 'r&b', 'reggae', 'indie', 
+                                          'dance', 'ambient', 'punk', 'latin']:
+                                genres.append(tag['name'])
+                    
+                    if genres:
+                        metadata["genre"] = ", ".join(genres[:2])
+        
+        except Exception as e:
+            self.console.print(f"[yellow]MusicBrainz error: {str(e)}[/yellow]")
+        
+        # If we didn't get metadata from MusicBrainz, try iTunes
+        if not metadata["album"] or not metadata["year"] or not metadata["genre"]:
+            try:
+                search_query = f"{artist} {title}"
+                itunes_url = f"https://itunes.apple.com/search?term={search_query.replace(' ', '+')}&media=music&limit=1"
+                
+                response = requests.get(itunes_url)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('resultCount', 0) > 0:
+                        result = data['results'][0]
+                        
+                        # Set album if not already set
+                        if not metadata["album"] and result.get('collectionName'):
+                            metadata["album"] = result['collectionName']
+                        
+                        # Set year if not already set
+                        if not metadata["year"] and result.get('releaseDate'):
+                            year_match = re.match(r'(\d{4})', result['releaseDate'])
+                            if year_match:
+                                metadata["year"] = year_match.group(1)
+                        
+                        # Set genre if not already set
+                        if not metadata["genre"] and result.get('primaryGenreName'):
+                            metadata["genre"] = result['primaryGenreName']
+                        
+                        # Set artwork URL if not already set
+                        if not metadata["artwork_url"] and result.get('artworkUrl100'):
+                            metadata["artwork_url"] = result['artworkUrl100'].replace('100x100', '600x600')
+            
+            except Exception as e:
+                self.console.print(f"[yellow]iTunes API error: {str(e)}[/yellow]")
+        
+        # Get lyrics
+        try:
+            lyrics = self._fetch_lyrics(artist, title)
+            if lyrics:
+                metadata["lyrics"] = lyrics
+        except Exception as e:
+            self.console.print(f"[yellow]Lyrics fetching error: {str(e)}[/yellow]")
+        
+        # Print collected metadata
+        self.console.print("\n[bold green]Metadata Results:[/bold green]")
+        for key, value in metadata.items():
+            if key == "lyrics":
+                if value:
+                    self.console.print(f"[bold]Lyrics:[/bold] [dim](Found - {len(value)} characters)[/dim]")
+                else:
+                    self.console.print(f"[bold]Lyrics:[/bold] [dim](Not found)[/dim]")
+            elif key == "artwork_url":
+                if value:
+                    self.console.print(f"[bold]Cover Art:[/bold] [blue]{value}[/blue]")
+                else:
+                    self.console.print(f"[bold]Cover Art:[/bold] [dim](Not found)[/dim]")
+            else:
+                self.console.print(f"[bold]{key.replace('_', ' ').title()}:[/bold] {value}")
+        
+        return metadata
+    
+    def _fetch_lyrics(self, artist, title):
+        """Try to fetch lyrics from multiple sources"""
+        lyrics_sources = [
+            self._fetch_lyrics_from_genius,
+            self._fetch_lyrics_from_musixmatch,
+            self._fetch_lyrics_from_lyricsovh
+        ]
+        
+        for source_func in lyrics_sources:
+            lyrics, source = source_func(artist, title)
+            if lyrics:
+                self.console.print(f"[green]Lyrics found from {source}[/green]")
+                return lyrics
+        
+        return None
+    
+    def _fetch_lyrics_from_genius(self, artist, title):
+        """Fetch lyrics from Genius via their API (search only) and web scraping"""
+        try:
+            search_query = f"{artist} {title}".replace(' ', '%20')
+            search_url = f"https://genius.com/api/search/multi?q={search_query}"
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            response = requests.get(search_url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                
+                if 'response' in data and 'sections' in data['response']:
+                    for section in data['response']['sections']:
+                        if section['type'] == 'song':
+                            if 'hits' in section and len(section['hits']) > 0:
+                                song = section['hits'][0]['result']
+                                song_url = song['url']
+                                
+                                song_response = requests.get(song_url, headers=headers)
+                                if song_response.status_code == 200:
+                                    html_content = song_response.text
+                                    
+                                    lyrics_pattern = r'<div data-lyrics-container="true"[^>]*>(.*?)</div>'
+                                    lyrics_matches = re.findall(lyrics_pattern, html_content, re.DOTALL)
+                                    
+                                    if lyrics_matches:
+                                        combined_lyrics = "\n".join(lyrics_matches)
+                                        
+                                        combined_lyrics = combined_lyrics.replace('<br>', '\n')
+                                        combined_lyrics = combined_lyrics.replace('<br/>', '\n')
+                                        combined_lyrics = combined_lyrics.replace('<BR>', '\n')
+                                        
+                                        lyrics = re.sub(r'<[^>]+>', '', combined_lyrics)
+                                        
+                                        lyrics = html.unescape(lyrics)
+                                        
+                                        lyrics = re.sub(r'\n{3,}', '\n\n', lyrics)
+                                        lyrics = lyrics.strip()
+                                        
+                                        return lyrics, "Genius"
+            
+            return None, None
+            
+        except Exception as e:
+            self.console.print(f"[yellow]Error fetching lyrics from Genius: {str(e)}[/yellow]")
+            return None, None
+    
+    def _fetch_lyrics_from_musixmatch(self, artist, title):
+        """Fetch lyrics from Musixmatch"""
+        try:
+            search_query = f"{artist} {title}".replace(' ', '%20')
+            search_url = f"https://api.musixmatch.com/ws/1.1/matcher.lyrics.get?format=json&q_track={title}&q_artist={artist}&apikey=2d782bc7a52a41ba2fc1ef05b9cf40d7"
+            
+            response = requests.get(search_url)
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data['message']['header']['status_code'] == 200:
+                    if 'lyrics' in data['message']['body']:
+                        lyrics = data['message']['body']['lyrics']['lyrics_body']
+                        
+                        if "..." in lyrics and "Paroles" in lyrics:
+                            lyrics = lyrics.split("...")[0].strip() + "..."
+                            
+                        return lyrics, "MusixMatch"
+            
+            return None, None
+            
+        except Exception as e:
+            self.console.print(f"[yellow]Error fetching lyrics from Musixmatch: {str(e)}[/yellow]")
+            return None, None
+    
+    def _fetch_lyrics_from_lyricsovh(self, artist, title):
+        """Fetch lyrics from lyrics.ovh API"""
+        try:
+            api_url = f"https://api.lyrics.ovh/v1/{artist.replace(' ', '%20')}/{title.replace(' ', '%20')}"
+            
+            response = requests.get(api_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                
+                if 'lyrics' in data:
+                    return data['lyrics'], "Lyrics.ovh"
+            
+            return None, None
+            
+        except Exception as e:
+            self.console.print(f"[yellow]Error fetching lyrics from Lyrics.ovh: {str(e)}[/yellow]")
+            return None, None
+    
+    def download_song(self, url_or_id, metadata=None, output_dir=None):
+        """Download a song with the given metadata"""
+        # Check if input is a number (index from search results)
+        try:
+            if isinstance(url_or_id, str) and url_or_id.isdigit():
+                index = int(url_or_id) - 1  # Convert from 1-based to 0-based indexing
+                
+                if not self.last_search_results:
+                    self.console.print("[red]No search results available. Please search first with 'search' command.[/red]")
+                    return False
+                
+                if index < 0 or index >= len(self.last_search_results):
+                    self.console.print(f"[red]Invalid index {index+1}. Available range: 1-{len(self.last_search_results)}[/red]")
+                    return False
+                    
+                # Get the video from search results
+                video = self.last_search_results[index]
+                self.console.print(f"[green]Selected: {video['title']} by {video['channel']}[/green]")
+                url_or_id = video["webpage_url"]
+                
+                # If no metadata provided, extract some info from the video title
+                if not metadata:
+                    metadata = {}
+                    title_parts = video["title"].split(" - ")
+                    
+                    if len(title_parts) > 1:
+                        artist = title_parts[0].strip()
+                        title = " - ".join(title_parts[1:]).strip()
+                        title = re.sub(r'\(.*?\)|\[.*?\]|Official Video|Lyrics', '', title).strip()
+                    else:
+                        artist = video["channel"]
+                        title = title_parts[0].strip()
+                        title = re.sub(r'\(.*?\)|\[.*?\]|Official Video|Lyrics', '', title).strip()
+                        parts = re.split(r'\s+by\s+', title, flags=re.IGNORECASE)
+                        if len(parts) > 1:
+                            title = parts[0].strip()
+                            artist = parts[1].strip()
+                    
+                    metadata['artist'] = artist
+                    metadata['title'] = title
+                    
+                    # Get enhanced metadata like in the GUI
+                    self.console.print(f"[bold blue]Fetching metadata for:[/bold blue] {artist} - {title}")
+                    enhanced_metadata = self.get_metadata(artist, title)
+                    
+                    # Merge with the metadata we already have
+                    for key, value in enhanced_metadata.items():
+                        if key not in ['artist', 'title'] or not metadata.get(key):
+                            metadata[key] = value
+        except ValueError:
+            # Not a number, continue with URL or ID
+            pass
+        
+        if not url_or_id:
+            self.console.print("[red]No URL or video ID provided[/red]")
+            return False
+            
+        if not output_dir:
+            output_dir = self.library_location
+            
+        if not os.path.exists(output_dir):
+            try:
+                os.makedirs(output_dir)
+            except Exception as e:
+                self.console.print(f"[red]Could not create output directory: {str(e)}[/red]")
+                return False
+                
+        # If just an ID is provided, construct the URL
+        if not url_or_id.startswith(('http://', 'https://')):
+            url_or_id = f"https://www.youtube.com/watch?v={url_or_id}"
+        
+        self.console.print(f"[bold blue]Downloading from:[/bold blue] {url_or_id}")
+        
+        # If no metadata provided, extract some basic info from the video
+        if not metadata:
+            metadata = {}
+            try:
+                with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+                    info = ydl.extract_info(url_or_id, download=False)
+                    title_parts = info['title'].split(" - ")
+                    
+                    if len(title_parts) > 1:
+                        metadata["artist"] = title_parts[0].strip()
+                        metadata["title"] = " - ".join(title_parts[1:]).strip()
+                        metadata["title"] = re.sub(r'\(.*?\)|\[.*?\]|Official Video|Lyrics', '', metadata["title"]).strip()
+                    else:
+                        metadata["artist"] = info.get('uploader', 'Unknown')
+                        metadata["title"] = title_parts[0].strip()
+                        metadata["title"] = re.sub(r'\(.*?\)|\[.*?\]|Official Video|Lyrics', '', metadata["title"]).strip()
+                
+                # Fetch additional metadata just like in the GUI
+                artist = metadata.get("artist", "")
+                title = metadata.get("title", "")
+                if artist and title:
+                    self.console.print(f"[bold blue]Fetching metadata for:[/bold blue] {artist} - {title}")
+                    enhanced_metadata = self.get_metadata(artist, title)
+                    
+                    # Merge with the metadata we already have
+                    for key, value in enhanced_metadata.items():
+                        if key not in ['artist', 'title'] or not metadata.get(key):
+                            metadata[key] = value
+                    
+            except Exception as e:
+                self.console.print(f"[yellow]Could not extract video info: {str(e)}[/yellow]")
+                metadata["artist"] = "Unknown"
+                metadata["title"] = "Unknown"
+        
+        # Create a valid filename
+        valid_filename = f"{metadata.get('artist', 'Unknown')} - {metadata.get('title', 'Unknown')}"
+        valid_filename = valid_filename.replace("/", "-").replace("\\", "-").replace(":", "-").replace("?", "").replace('"', "")
+        save_path = os.path.join(output_dir, f"{valid_filename}.mp3")
+        
+        # Download the song
+        with Progress() as progress:
+            download_task = progress.add_task("[green]Downloading...", total=100)
+            
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_filename = os.path.join(temp_dir, "audio")
+                    
+                    def progress_hook(d):
+                        if d['status'] == 'downloading':
+                            p = d.get('_percent_str', '0%').replace('%', '')
+                            try:
+                                progress.update(download_task, completed=float(p))
+                            except:
+                                pass
+                    
+                    # Configure yt-dlp options
+                    ydl_opts = {
+                        'format': 'bestaudio/best',
+                        'outtmpl': temp_filename,
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'mp3',
+                            'preferredquality': '192',
+                        }],
+                        'quiet': True,
+                        'no_warnings': True,
+                        'progress_hooks': [progress_hook]
+                    }
+                    
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url_or_id])
+                    
+                    downloaded_file = temp_filename + ".mp3"
+                    if os.path.exists(downloaded_file):
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                        
+                        shutil.copy2(downloaded_file, save_path)
+                        
+                        # Set metadata in the MP3 file
+                        progress.update(download_task, description="[yellow]Setting metadata...")
+                        self._set_metadata(save_path, metadata)
+                        
+                        progress.update(download_task, completed=100, description="[bold green]Download complete!")
+                        self.console.print(f"\n[bold green]Success![/bold green] File saved to: {save_path}")
+                        return True
+                    else:
+                        self.console.print("[red]Error: Downloaded file not found[/red]")
+                        return False
+            
+            except Exception as e:
+                self.console.print(f"\n[bold red]Download failed:[/bold red] {str(e)}")
+                return False
+    
+    def _set_metadata(self, file_path, metadata):
+        """Set ID3 metadata for the downloaded MP3 file"""
+        try:
+            # First delete existing tags
+            try:
+                audio = MP3(file_path)
+                audio.delete()
+                audio.save()
+            except Exception:
+                pass
+            
+            tags = ID3()
+            
+            # Set title
+            if metadata.get('title'):
+                tags.add(TIT2(encoding=3, text=metadata['title']))
+            
+            # Set artist
+            if metadata.get('artist'):
+                tags.add(TPE1(encoding=3, text=metadata['artist']))
+            
+            # Set album
+            if metadata.get('album'):
+                tags.add(TALB(encoding=3, text=metadata['album']))
+            
+            # Set year
+            if metadata.get('year'):
+                tags.add(TDRC(encoding=3, text=metadata['year']))
+            
+            # Set genre
+            if metadata.get('genre'):
+                tags.add(TCON(encoding=3, text=metadata['genre']))
+                
+            # Set track number
+            if metadata.get('track_number'):
+                tags.add(TRCK(encoding=3, text=metadata['track_number']))
+            
+            # Add lyrics if provided
+            if metadata.get('lyrics'):
+                tags.add(USLT(
+                    encoding=3,  # UTF-8
+                    lang='eng',  # Language code (English)
+                    desc='',     # Description
+                    text=metadata['lyrics']
+                ))
+            
+            # Add album art if we have a URL
+            if metadata.get('artwork_url'):
+                try:
+                    response = requests.get(metadata['artwork_url'])
+                    if response.status_code == 200:
+                        tags.add(APIC(
+                            encoding=3,  # UTF-8
+                            mime='image/jpeg',
+                            type=3,  # Cover image
+                            desc='Cover',
+                            data=response.content
+                        ))
+                except Exception as e:
+                    self.console.print(f"[yellow]Error setting album art: {str(e)}[/yellow]")
+            
+            # Save the tags to the file
+            tags.save(file_path)
+            return True
+                
+        except Exception as e:
+            self.console.print(f"[red]Error setting metadata: {str(e)}[/red]")
+            return False
+
+    def set_library_location(self, path):
+        """Set the library location"""
+        if not os.path.exists(path):
+            try:
+                os.makedirs(path)
+            except Exception as e:
+                self.console.print(f"[red]Could not create directory: {str(e)}[/red]")
+                return False
+        
+        self.library_location = path
+        self.save_settings()
+        self.console.print(f"[green]Library location set to:[/green] {path}")
+        return True
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Music Library Extender - Download music from YouTube with proper metadata')
+    parser.add_argument('--cli', action='store_true', help='Run in CLI mode instead of GUI')
+    subparsers = parser.add_subparsers(dest='command', help='CLI commands')
+
+    # Search command
+    search_parser = subparsers.add_parser('search', help='Search for songs')
+    search_parser.add_argument('query', help='Search query')
+    search_parser.add_argument('--limit', type=int, default=10, help='Maximum number of results (default: 10)')
+    search_parser.add_argument('--json', action='store_true', help='Output results as JSON')
+
+    # Download command
+    download_parser = subparsers.add_parser('download', help='Download a song')
+    download_parser.add_argument('url_or_id', help='YouTube URL, video ID, or result number (1-based) from the last search')
+    download_parser.add_argument('--output-dir', '-o', help='Output directory (default: library location from settings)')
+    download_parser.add_argument('--artist', help='Artist name (optional, will be auto-detected)')
+    download_parser.add_argument('--title', help='Song title (optional, will be auto-detected)')
+    download_parser.add_argument('--album', help='Album name (optional, will be auto-detected)')
+    download_parser.add_argument('--year', help='Release year (optional, will be auto-detected)')
+    download_parser.add_argument('--genre', help='Genre (optional, will be auto-detected)')
+    download_parser.add_argument('--track', help='Track number (optional, will be auto-detected)')
+    download_parser.add_argument('--skip-metadata', action='store_true', help='Skip automatic metadata lookup')
+
+    # Metadata command
+    metadata_parser = subparsers.add_parser('metadata', help='Look up metadata without downloading')
+    metadata_parser.add_argument('artist', help='Artist name')
+    metadata_parser.add_argument('title', help='Song title')
+
+    # Library command
+    library_parser = subparsers.add_parser('library', help='Set library location')
+    library_parser.add_argument('path', help='Path to music library')
+
+    return parser.parse_args()
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = MusicLibraryExtender(root)
-    root.mainloop()
+    args = parse_arguments()
+    
+    if args.cli:
+        # CLI mode
+        cli_handler = CLIHandler()
+        
+        if args.command == 'search':
+            cli_handler.search_videos(args.query, limit=args.limit, json_output=args.json)
+        
+        elif args.command == 'download':
+            metadata = {}
+            if args.artist:
+                metadata['artist'] = args.artist
+            if args.title:
+                metadata['title'] = args.title
+            if args.album:
+                metadata['album'] = args.album
+            if args.year:
+                metadata['year'] = args.year
+            if args.genre:
+                metadata['genre'] = args.genre
+            if args.track:
+                metadata['track_number'] = args.track
+                
+            # If we have artist and title but not other metadata, and auto metadata is not disabled
+            if not args.skip_metadata and args.artist and args.title and not (args.album or args.year or args.genre):
+                console = Console()
+                console.print("[yellow]No complete metadata provided. Fetching from online sources...[/yellow]")
+                fetched_metadata = cli_handler.get_metadata(args.artist, args.title)
+                
+                # Update with fetched metadata but keep user-provided values
+                for key, value in fetched_metadata.items():
+                    if key not in ['artist', 'title'] and value and key not in metadata:
+                        metadata[key] = value
+            
+            cli_handler.download_song(args.url_or_id, metadata, args.output_dir)
+        
+        elif args.command == 'metadata':
+            cli_handler.get_metadata(args.artist, args.title)
+        
+        elif args.command == 'library':
+            cli_handler.set_library_location(args.path)
+        
+        else:
+            console = Console()
+            console.print("[red]Please specify a command. Use --help for options.[/red]")
+            sys.exit(1)
+    else:
+        # GUI mode
+        root = tk.Tk()
+        app = MusicLibraryExtender(root)
+        root.mainloop()
